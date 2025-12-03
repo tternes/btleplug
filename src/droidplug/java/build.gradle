@@ -46,7 +46,6 @@ afterEvaluate {
         publications {
             release(MavenPublication) {
                 groupId = "com.github.tternes"
-                artifactId = "droidplug"
                 from components.release
             }
         }
