@@ -1,3 +1,6 @@
+jdk:
+  - temurin-17
+
 install:
   - cd src/droidplug/java
   - ./gradlew build publishToMavenLocal
