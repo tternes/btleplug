@@ -40,3 +40,13 @@ android {
 dependencies {
     implementation "com.github.tternes:jni-utils-rs:14244d5"
 }
+
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+            }
+        }
+    }
+}
