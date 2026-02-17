@@ -38,7 +38,7 @@ android {
 }
 
 dependencies {
-    implementation "com.github.tternes:jni-utils-rs:14244d5"
+    implementation "com.github.tternes:jni-utils-rs:73d2e75"
 }
 
 afterEvaluate {
