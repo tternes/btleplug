@@ -1,0 +1,8 @@
+jdk:
+  - openjdk17
+
+install:
+  - cd src/droidplug/java
+  # $VERSION is the git ref JitPack was asked to build. The publication has to carry
+  # that version, or JitPack finds no artifact for the ref it is serving.
+  - ./gradlew build publishToMavenLocal -PpublishVersion=$VERSION
