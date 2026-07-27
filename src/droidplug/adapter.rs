@@ -173,6 +173,17 @@ impl Central for Adapter {
     }
 }
 
+pub(crate) fn adapter_report_scan_failed_internal(
+    env: &JNIEnv,
+    obj: JObject,
+    error_code: jni::sys::jint,
+) -> crate::Result<()> {
+    let adapter = env.get_rust_field::<_, _, Adapter>(obj, "handle")?;
+    log::warn!("BLE scan failed with error code: {error_code}");
+    adapter.manager.emit(CentralEvent::ScanFailed { error_code });
+    Ok(())
+}
+
 pub(crate) fn adapter_report_scan_result_internal(
     env: &JNIEnv,
     obj: JObject,

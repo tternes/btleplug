@@ -39,11 +39,13 @@ class Adapter {
         ScanSettings settings;
         if (Build.VERSION.SDK_INT >= 26) {
             settings = new ScanSettings.Builder()
+                    .setScanMode(filter.getScanMode())
                     .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
                     .setLegacy(false)
                     .build();
         } else {
             settings = new ScanSettings.Builder()
+                    .setScanMode(filter.getScanMode())
                     .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
                     .build();
         }
@@ -66,6 +68,7 @@ class Adapter {
     }
 
     private native void reportScanResult(ScanResult result);
+    private native void reportScanFailed(int errorCode);
 
     public native void onConnectionStateChanged(String address, boolean connected);
 
@@ -73,6 +76,11 @@ class Adapter {
         @Override
         public void onScanResult(int callbackType, ScanResult result) {
             Adapter.this.reportScanResult(result);
+        }
+
+        @Override
+        public void onScanFailed(int errorCode) {
+            Adapter.this.reportScanFailed(errorCode);
         }
     }
 }

@@ -1,7 +1,7 @@
 pub mod objects;
 
 use ::jni::{objects::JObject, JNIEnv, JavaVM, NativeMethod};
-use jni::{objects::JString, sys::jboolean};
+use jni::{objects::JString, sys::{jboolean, jint}};
 use once_cell::sync::OnceCell;
 use std::ffi::c_void;
 
@@ -18,6 +18,11 @@ pub fn init(env: &JNIEnv) -> crate::Result<()> {
                     name: "reportScanResult".into(),
                     sig: "(Landroid/bluetooth/le/ScanResult;)V".into(),
                     fn_ptr: adapter_report_scan_result as *mut c_void,
+                },
+                NativeMethod {
+                    name: "reportScanFailed".into(),
+                    sig: "(I)V".into(),
+                    fn_ptr: adapter_report_scan_failed as *mut c_void,
                 },
                 NativeMethod {
                     name: "onConnectionStateChanged".into(),
@@ -72,6 +77,10 @@ impl From<::jni::errors::Error> for crate::Error {
 
 extern "C" fn adapter_report_scan_result(env: JNIEnv, obj: JObject, scan_result: JObject) {
     let _ = super::adapter::adapter_report_scan_result_internal(&env, obj, scan_result);
+}
+
+extern "C" fn adapter_report_scan_failed(env: JNIEnv, obj: JObject, error_code: jint) {
+    let _ = super::adapter::adapter_report_scan_failed_internal(&env, obj, error_code);
 }
 
 extern "C" fn adapter_on_connection_state_changed(

@@ -203,12 +203,31 @@ pub struct PeripheralProperties {
     derive(Serialize, Deserialize),
     serde(crate = "serde_cr")
 )]
+/// Hint for how aggressively the platform should scan. Not all platforms support this.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ScanMode {
+    /// Low power scan (platform default). Results may be throttled or deferred.
+    #[default]
+    LowPower,
+    /// Balanced duty cycle between power and latency.
+    Balanced,
+    /// Continuous scanning with lowest latency. Highest power consumption.
+    LowLatency,
+}
+
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(crate = "serde_cr")
+)]
 /// The filter used when scanning for BLE devices.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ScanFilter {
     /// If the filter contains at least one service UUID, only devices supporting at least one of
     /// the given services will be available.
     pub services: Vec<Uuid>,
+    /// Hint for scan aggressiveness. Only effective on Android.
+    pub scan_mode: ScanMode,
 }
 
 /// The type of write operation to use.
@@ -337,6 +356,8 @@ pub enum CentralEvent {
         services: Vec<Uuid>,
     },
     StateUpdate(CentralState),
+    /// Emitted when the platform reports a scan failure (e.g. Android ScanCallback.onScanFailed)
+    ScanFailed { error_code: i32 },
 }
 
 /// Central is the "client" of BLE. It's able to scan for and establish connections to peripherals.

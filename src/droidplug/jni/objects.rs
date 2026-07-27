@@ -514,6 +514,8 @@ pub struct JScanFilter<'a> {
 
 impl<'a> JScanFilter<'a> {
     pub fn new(env: &'a JNIEnv<'a>, filter: ScanFilter) -> Result<Self> {
+        use crate::api::ScanMode;
+
         let uuids = env.new_object_array(
             filter.services.len() as i32,
             env.find_class("java/lang/String")?,
@@ -523,6 +525,11 @@ impl<'a> JScanFilter<'a> {
             let uuid_str = env.new_string(uuid.to_string())?;
             env.set_object_array_element(uuids, idx as i32, uuid_str)?;
         }
+        let scan_mode: i32 = match filter.scan_mode {
+            ScanMode::LowPower => 0,
+            ScanMode::Balanced => 1,
+            ScanMode::LowLatency => 2,
+        };
         let obj = env.new_object(
             JClass::from(
                 jni_utils::classcache::get_class(
@@ -531,9 +538,8 @@ impl<'a> JScanFilter<'a> {
                 .unwrap()
                 .as_obj(),
             ),
-            //class.as_obj(),
-            "([Ljava/lang/String;)V",
-            &[uuids.into()],
+            "([Ljava/lang/String;I)V",
+            &[uuids.into(), scan_mode.into()],
         )?;
         Ok(Self { internal: obj })
     }
