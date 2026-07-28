@@ -80,7 +80,12 @@ pub struct JFutureIntoFuture<'a: 'b, 'b>(JFuture<'a, 'b>);
 impl<'a: 'b, 'b> JFutureIntoFuture<'a, 'b> {
     fn poll_internal(&self, context: &mut Context<'_>) -> Result<Poll<JPollResult<'a, 'b>>> {
         use super::task::waker;
-        let result = self.0.poll(waker(self.0.env, context.waker().clone())?)?;
+        // See JStream::poll_next_internal: the waker's local reference is dead once poll
+        // returns, and polling threads never return to Java to free it.
+        let waker = waker(self.0.env, context.waker().clone())?;
+        let polled = self.0.poll(waker);
+        let _ = self.0.env.delete_local_ref(waker);
+        let result = polled?;
         Ok(
             if self.0.env.is_same_object(result.clone(), JObject::null())? {
                 Poll::Pending
@@ -127,8 +132,13 @@ impl<'a: 'b, 'b> TryFrom<JFuture<'a, 'b>> for JSendFuture {
     type Error = Error;
 
     fn try_from(future: JFuture<'a, 'b>) -> Result<Self> {
+        let internal = future.env.new_global_ref(future.internal)?;
+        // The global reference owns the object from here on. Dropping the local one
+        // also releases whatever the Java future still holds — notably the waker it
+        // was last polled with, which lives in one of its fields.
+        let _ = future.env.delete_local_ref(future.internal);
         Ok(Self {
-            internal: future.env.new_global_ref(future.internal)?,
+            internal,
             vm: future.env.get_java_vm()?,
         })
     }
@@ -146,9 +156,16 @@ impl JSendFuture {
     fn poll_internal(&self, context: &mut Context<'_>) -> Result<Poll<Result<GlobalRef>>> {
         let env = self.vm.get_env()?;
         let jfuture = JFuture::from_env(&env, self.internal.as_obj())?.into_future();
-        jfuture
-            .poll_internal(context)
-            .map(|result| result.map(|result| Ok(env.new_global_ref(result)?)))
+        jfuture.poll_internal(context).map(|result| {
+            result.map(|result| {
+                // Handed on as a global reference; the local one would otherwise persist
+                // for the life of the attachment.
+                let obj: JObject = result.into();
+                let global = env.new_global_ref(obj);
+                let _ = env.delete_local_ref(obj);
+                Ok(global?)
+            })
+        })
     }
 }
 
