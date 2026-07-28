@@ -58,6 +58,10 @@ impl<'a: 'b, 'b> JStream<'a, 'b> {
             Poll::Ready({
                 let poll = JPollResult::from_env(self.env, result)?;
                 let stream_poll_obj = poll.get()?;
+                // The StreamPoll closure captures the queued item, so holding its local
+                // reference pins that item for the life of the attachment even after the
+                // item itself has been handed on as a global reference.
+                let _auto_stream_poll = self.env.auto_local(stream_poll_obj);
                 if self.env.is_same_object(stream_poll_obj, JObject::null())? {
                     None
                 } else {
@@ -70,7 +74,15 @@ impl<'a: 'b, 'b> JStream<'a, 'b> {
 
     fn poll_next_internal(&self, context: &mut Context) -> Result<Poll<Option<JObject<'a>>>> {
         use super::task::waker;
-        self.j_poll_next(waker(self.env, context.waker().clone())?)
+        // The waker's local reference is dead once pollNext returns: on the pending path
+        // Java has stored it in a field, and on the ready path Java has closed it. Freeing
+        // it matters because polling happens on threads that are attached for their whole
+        // lifetime and never return to Java, so nothing ever pops their local reference
+        // frame and every leaked reference pins its object for the life of the process.
+        let waker = waker(self.env, context.waker().clone())?;
+        let result = self.j_poll_next(waker);
+        let _ = self.env.delete_local_ref(waker);
+        result
     }
 }
 
@@ -110,8 +122,12 @@ impl<'a: 'b, 'b> TryFrom<JStream<'a, 'b>> for JSendStream {
     type Error = Error;
 
     fn try_from(stream: JStream<'a, 'b>) -> Result<Self> {
+        let internal = stream.env.new_global_ref(stream.internal)?;
+        // As in JSendFuture: the global reference takes ownership, so the caller's
+        // local reference would only pin the stream for the life of the attachment.
+        let _ = stream.env.delete_local_ref(stream.internal);
         Ok(Self {
-            internal: stream.env.new_global_ref(stream.internal)?,
+            internal,
             vm: stream.env.get_java_vm()?,
         })
     }
@@ -132,9 +148,17 @@ impl JSendStream {
     ) -> Result<Poll<Option<Result<GlobalRef>>>> {
         let env = self.vm.get_env()?;
         let jstream = JStream::from_env(&env, self.internal.as_obj())?;
-        jstream
-            .poll_next_internal(context)
-            .map(|result| result.map(|result| result.map(|obj| env.new_global_ref(obj))))
+        jstream.poll_next_internal(context).map(|result| {
+            result.map(|result| {
+                result.map(|obj| {
+                    // Each delivered item is handed to the caller as a global reference;
+                    // its local reference would otherwise accumulate per notification.
+                    let global = env.new_global_ref(obj);
+                    let _ = env.delete_local_ref(obj);
+                    global
+                })
+            })
+        })
     }
 }
 

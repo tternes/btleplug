@@ -8,7 +8,9 @@ use std::task::Waker;
 
 /// Wraps the given waker in a `io.github.gedgygedgy.rust.task.Waker` object.
 pub fn waker<'a: 'b, 'b>(env: &'b JNIEnv<'a>, waker: Waker) -> Result<JObject<'a>> {
-    let runnable = super::ops::fn_once_runnable(env, |_e, _o| waker.wake())?;
+    // The constructed Waker holds the runnable in a field, so its local reference is
+    // only needed for the constructor call.
+    let runnable = env.auto_local(super::ops::fn_once_runnable(env, |_e, _o| waker.wake())?);
 
     let obj = env.new_object(
         JClass::from(
@@ -17,7 +19,7 @@ pub fn waker<'a: 'b, 'b>(env: &'b JNIEnv<'a>, waker: Waker) -> Result<JObject<'a
                 .as_obj(),
         ),
         "(Lio/github/gedgygedgy/rust/ops/FnRunnable;)V",
-        &[runnable.into()],
+        &[runnable.as_obj().into()],
     )?;
     Ok(obj)
 }
