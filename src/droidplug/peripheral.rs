@@ -242,23 +242,6 @@ impl api::Peripheral for Peripheral {
             }
             Ok(())
         })?;
-        // Auto-negotiate maximum MTU (517) after connection
-        {
-            let mtu_future = self.with_obj(|env, obj| {
-                let mtu_obj = obj.request_mtu(env, 517)?;
-                let mtu_future = env.cast_local::<JFuture>(mtu_obj)?;
-                Ok(JSendFuture::new(env, &mtu_future)?)
-            })?;
-            let mtu_result_ref = mtu_future.await?;
-            self.with_obj(|env, _obj| -> Result<()> {
-                let mtu_obj = get_poll_result(env, &mtu_result_ref)?;
-                let mtu_val = env
-                    .call_method(&mtu_obj, jni_str!("intValue"), jni_sig!("()I"), &[])?
-                    .i()?;
-                self.mtu.store(mtu_val as u16, Ordering::Relaxed);
-                Ok(())
-            })?;
-        }
         Ok(())
     }
 
