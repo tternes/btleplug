@@ -481,6 +481,14 @@ class Peripheral {
                                 Peripheral.this.wakeCommand(future, rssi);
                             });
                         }
+                        @Override
+                        public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+                            if (status != BluetoothGatt.GATT_SUCCESS || newState == BluetoothGatt.STATE_DISCONNECTED) {
+                                Peripheral.this.asyncWithFuture(future, () -> {
+                                    throw new NotConnectedException();
+                                });
+                            }
+                        }
                     });
                     if (!this.gatt.readRemoteRssi()) {
                         throw new RuntimeException("Unable to read remote RSSI");
@@ -578,6 +586,12 @@ class Peripheral {
                 }
                 if (Peripheral.this.commandCallback != null) {
                     Peripheral.this.commandCallback.onConnectionStateChange(gatt, status, newState);
+                }
+                // A disconnected client stays registered until closed, and this peripheral is
+                // evicted on disconnect, so it is never reused.
+                if (newState == BluetoothGatt.STATE_DISCONNECTED && Peripheral.this.gatt == gatt) {
+                    gatt.close();
+                    Peripheral.this.gatt = null;
                 }
             }
             switch (newState) {
