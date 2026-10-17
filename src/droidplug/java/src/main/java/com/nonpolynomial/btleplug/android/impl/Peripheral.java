@@ -648,6 +648,13 @@ class Peripheral {
                     Peripheral.this.dispatchToCommandCallback("onConnectionStateChange",
                             () -> Peripheral.this.commandCallback.onConnectionStateChange(gatt, status, newState));
                 }
+                // A disconnected client stays registered with the stack until it is closed, and the
+                // adapter evicts this peripheral on disconnect, so an unclosed client is never
+                // reused. A command in flight closes it itself; close it here when none was.
+                if (newState == BluetoothGatt.STATE_DISCONNECTED && Peripheral.this.gatt == gatt) {
+                    gatt.close();
+                    Peripheral.this.gatt = null;
+                }
                 suppressDisconnectNotification = Peripheral.this.suppressDisconnectNotification;
                 // A failed connect closes the gatt and clears `connected` even if the state was CONNECTED.
                 nowConnected = Peripheral.this.connected;
