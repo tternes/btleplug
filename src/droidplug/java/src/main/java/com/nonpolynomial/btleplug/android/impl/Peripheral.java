@@ -15,10 +15,10 @@ import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 import io.github.gedgygedgy.rust.future.Future;
@@ -44,9 +44,13 @@ class Peripheral {
     static final long CONNECT_RETRY_DELAY_MS = 200;
     static final long CONNECT_RETRY_MAX_ELAPSED_MS = 10_000;
 
-    // Library-owned scheduler for connect retries: deliberately not tied to any app's main
-    // looper, since an app that blocks its main thread while awaiting connect() would otherwise
-    // deadlock waiting for its own looper to run the retry.
+    // Far beyond any healthy GATT round trip, so expiry means Android dropped the callback.
+    // Connect is exempt: Android bounds it itself (~30s direct-connect timeout).
+    static final long COMMAND_TIMEOUT_MS = 5_000;
+
+    // Library-owned scheduler for connect retries and command timeouts: deliberately not tied to
+    // any app's main looper, since an app that blocks its main thread while awaiting connect()
+    // would otherwise deadlock waiting for its own looper to run the retry.
     private static final ScheduledExecutorService RETRY_EXECUTOR =
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "btleplug-connect-retry");
@@ -69,9 +73,12 @@ class Peripheral {
     private int connectionLatency = -1;
     private int supervisionTimeout = -1;  // in 10ms units
 
-    private final Queue<Runnable> commandQueue = new LinkedList<>();
+    private final CommandQueue commandQueue = new CommandQueue(this, (task, delayMs) -> {
+        ScheduledFuture<?> scheduled =
+                RETRY_EXECUTOR.schedule(task, delayMs, TimeUnit.MILLISECONDS);
+        return () -> scheduled.cancel(false);
+    }, this::failTimedOutCommand);
     private final LinkedList<WeakReference<QueueStream<BluetoothGattCharacteristic>>> notificationStreams = new LinkedList<>();
-    private boolean executingCommand = false;
     private CommandCallback commandCallback;
 
     public Peripheral(Adapter adapter, String address) {
@@ -88,7 +95,7 @@ class Peripheral {
     public Future<Void> connect() {
         SimpleFuture<Void> future = new SimpleFuture<>();
         synchronized (this) {
-            this.queueCommand(() -> this.attemptConnect(future, 0));
+            this.queueCommand(() -> this.attemptConnect(future, 0), 0);
         }
         return future;
     }
@@ -572,11 +579,24 @@ class Peripheral {
     }
 
     private void queueCommand(Runnable callback) {
-        if (this.executingCommand) {
-            this.commandQueue.add(callback);
-        } else {
-            this.executingCommand = true;
-            callback.run();
+        this.queueCommand(callback, COMMAND_TIMEOUT_MS);
+    }
+
+    private void queueCommand(Runnable callback, long timeoutMs) {
+        this.commandQueue.enqueue(callback, timeoutMs);
+    }
+
+    // A late callback for the failed command finds no command callback, or the next command's.
+    // CommandCallback ignores callbacks a command didn't ask for, so only a late callback of the
+    // same kind as the next command (e.g. two RSSI reads in a row) is taken as that command's.
+    private void failTimedOutCommand() {
+        CommandCallback callback = this.commandCallback;
+        this.commandCallback = null;
+        Log.e(TAG, "GATT command for " + this.device.getAddress() + " got no callback within "
+                + COMMAND_TIMEOUT_MS + "ms; failing it and running the next ("
+                + this.commandQueue.pendingCount() + " queued)");
+        if (callback != null) {
+            callback.future.wakeWithThrowable(new CommandTimeoutException(COMMAND_TIMEOUT_MS));
         }
     }
 
@@ -586,14 +606,8 @@ class Peripheral {
     }
 
     private void runNextCommand() {
-        assert this.executingCommand;
         this.commandCallback = null;
-        if (this.commandQueue.isEmpty()) {
-            this.executingCommand = false;
-        } else {
-            Runnable callback = this.commandQueue.remove();
-            callback.run();
-        }
+        this.commandQueue.finish();
     }
 
     private <T> void wakeCommand(SimpleFuture<T> future, T result) {
