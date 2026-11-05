@@ -33,6 +33,7 @@ use std::{
     pin::Pin,
     sync::atomic::{AtomicU16, Ordering},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 #[cfg_attr(
@@ -101,6 +102,11 @@ fn get_poll_result<'a>(
                     Err(Error::NoSuchCharacteristic)
                 } else if check_exception!(JNoBluetoothAdapterException, env, &cause) {
                     Err(Error::NoAdapterAvailable)
+                } else if check_exception!(JOperationTimeoutException, env, &cause) {
+                    let timeout_ms = env
+                        .call_method(&cause, jni_str!("getTimeoutMs"), jni_sig!("()J"), &[])?
+                        .j()?;
+                    Err(Error::TimedOut(Duration::from_millis(timeout_ms as u64)))
                 } else if env.is_instance_of(&cause, jni_str!("java/lang/RuntimeException"))? {
                     let msg = env
                         .call_method(

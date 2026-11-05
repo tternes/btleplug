@@ -73,6 +73,7 @@ fn init_inner(env: &mut Env) -> crate::Result<()> {
         <JUnexpectedCharacteristicException as Reference>::lookup_class(env, &loader)?;
         <JNoSuchCharacteristicException as Reference>::lookup_class(env, &loader)?;
         <JNoBluetoothAdapterException as Reference>::lookup_class(env, &loader)?;
+        <JOperationTimeoutException as Reference>::lookup_class(env, &loader)?;
         <JFuture as Reference>::lookup_class(env, &loader)?;
         <JFutureException as Reference>::lookup_class(env, &loader)?;
         <JFnAdapter as Reference>::lookup_class(env, &loader)?;

@@ -15,12 +15,13 @@ import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
+import com.nonpolynomial.btleplug.android.impl.GattOperations.Operation;
 import io.github.gedgygedgy.rust.future.Future;
 import io.github.gedgygedgy.rust.stream.QueueStream;
 import io.github.gedgygedgy.rust.future.SimpleFuture;
@@ -44,12 +45,12 @@ class Peripheral {
     static final long CONNECT_RETRY_DELAY_MS = 200;
     static final long CONNECT_RETRY_MAX_ELAPSED_MS = 10_000;
 
-    // Library-owned scheduler for connect retries: deliberately not tied to any app's main
-    // looper, since an app that blocks its main thread while awaiting connect() would otherwise
-    // deadlock waiting for its own looper to run the retry.
-    private static final ScheduledExecutorService RETRY_EXECUTOR =
+    // Library-owned scheduler for connect retries and deadlines: deliberately not tied to any
+    // app's main looper, since an app that blocks its main thread while awaiting an operation
+    // would otherwise deadlock waiting for its own looper to run the timer.
+    private static final ScheduledExecutorService SCHEDULER =
             Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "btleplug-connect-retry");
+                Thread t = new Thread(r, "btleplug-gatt-timers");
                 t.setDaemon(true);
                 return t;
             });
@@ -69,10 +70,9 @@ class Peripheral {
     private int connectionLatency = -1;
     private int supervisionTimeout = -1;  // in 10ms units
 
-    private final Queue<Runnable> commandQueue = new LinkedList<>();
+    private final GattOperations<CommandCallback> operations =
+            new GattOperations<>(this, this::scheduleTimer, this::onDeadline);
     private final LinkedList<WeakReference<QueueStream<BluetoothGattCharacteristic>>> notificationStreams = new LinkedList<>();
-    private boolean executingCommand = false;
-    private CommandCallback commandCallback;
 
     public Peripheral(Adapter adapter, String address) {
         BluetoothAdapter bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
@@ -88,7 +88,7 @@ class Peripheral {
     public Future<Void> connect() {
         SimpleFuture<Void> future = new SimpleFuture<>();
         synchronized (this) {
-            this.queueCommand(() -> this.attemptConnect(future, 0));
+            this.operations.enqueue(Operation.CONNECT, future, () -> this.attemptConnect(future, 0));
         }
         return future;
     }
@@ -114,7 +114,7 @@ class Peripheral {
     private void attemptConnect(SimpleFuture<Void> future, int attempt) {
         this.asyncWithFuture(future, () -> {
             long attemptStartMs = SystemClock.elapsedRealtime();
-            CommandCallback callback = new CommandCallback(future) {
+            CommandCallback callback = new CommandCallback() {
                 @Override
                 public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
                     Peripheral.this.asyncWithFuture(future, () -> {
@@ -126,13 +126,13 @@ class Peripheral {
                                     Peripheral.this.gatt.close();
                                     Peripheral.this.gatt = null;
                                 }
-                                Peripheral.this.commandCallback = null;
+                                Peripheral.this.operations.withdraw();
                                 Peripheral.this.suppressDisconnectNotification = true;
                                 // Not kept: nothing here needs to cancel a pending retry, and a
                                 // pending retry already holds a reference to this Peripheral via
                                 // the closure, keeping it alive until it runs.
-                                RETRY_EXECUTOR.schedule(() -> {
-                                    Peripheral.this.dispatchToCommandCallback("connectRetry", () -> {
+                                SCHEDULER.schedule(() -> {
+                                    Peripheral.this.runGuarded("connectRetry", () -> {
                                         synchronized (Peripheral.this) {
                                             Peripheral.this.attemptConnect(future, attempt + 1);
                                         }
@@ -150,17 +150,17 @@ class Peripheral {
                         }
 
                         if (newState == BluetoothGatt.STATE_CONNECTED) {
-                            Peripheral.this.wakeCommand(future, null);
+                            Peripheral.this.operations.complete(future, null);
                         }
                     });
                 }
             };
 
             if (this.connected) {
-                Peripheral.this.wakeCommand(future, null);
+                Peripheral.this.operations.complete(future, null);
             } else if (this.gatt == null) {
                 try {
-                    this.setCommandCallback(callback);
+                    this.operations.issue(callback);
                     this.gatt = this.device.connectGatt(null, false, this.callback);
                     if (this.gatt == null) {
                         throw new NotConnectedException();
@@ -169,7 +169,7 @@ class Peripheral {
                     throw new PermissionDeniedException(ex);
                 }
             } else {
-                this.setCommandCallback(callback);
+                this.operations.issue(callback);
                 if (!this.gatt.connect()) {
                     throw new RuntimeException("Unable to reconnect to device");
                 }
@@ -181,12 +181,12 @@ class Peripheral {
     public Future<Void> disconnect() {
         SimpleFuture<Void> future = new SimpleFuture<>();
         synchronized (this) {
-            this.queueCommand(() -> {
+            this.operations.enqueue(Operation.DISCONNECT, future, () -> {
                 this.asyncWithFuture(future, () -> {
                     if (!this.connected) {
-                        Peripheral.this.wakeCommand(future, null);
+                        Peripheral.this.operations.complete(future, null);
                     } else {
-                        this.setCommandCallback(new CommandCallback(future) {
+                        this.operations.issue(new CommandCallback() {
                             @Override
                             public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
                                 Peripheral.this.asyncWithFuture(future, () -> {
@@ -197,7 +197,7 @@ class Peripheral {
                                     if (newState == BluetoothGatt.STATE_DISCONNECTED) {
                                         Peripheral.this.gatt.close();
                                         Peripheral.this.gatt = null;
-                                        Peripheral.this.wakeCommand(future, null);
+                                        Peripheral.this.operations.complete(future, null);
                                     }
                                 });
                             }
@@ -246,19 +246,19 @@ class Peripheral {
     public Future<Integer> requestMtu(int mtu) {
         SimpleFuture<Integer> future = new SimpleFuture<>();
         synchronized (this) {
-            this.queueCommand(() -> {
+            this.operations.enqueue(Operation.REQUEST_MTU, future, () -> {
                 this.asyncWithFuture(future, () -> {
                     if (!this.connected) {
                         throw new NotConnectedException();
                     }
-                    this.setCommandCallback(new CommandCallback(future) {
+                    this.operations.issue(new CommandCallback() {
                         @Override
                         public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
                             Peripheral.this.asyncWithFuture(future, () -> {
                                 if (status != BluetoothGatt.GATT_SUCCESS) {
                                     throw new RuntimeException("MTU negotiation failed, status: " + status);
                                 }
-                                Peripheral.this.wakeCommand(future, mtu);
+                                Peripheral.this.operations.complete(future, mtu);
                             });
                         }
                     });
@@ -275,14 +275,14 @@ class Peripheral {
     public Future<byte[]> read(UUID uuid) {
         SimpleFuture<byte[]> future = new SimpleFuture<>();
         synchronized (this) {
-            this.queueCommand(() -> {
+            this.operations.enqueue(Operation.READ, future, () -> {
                 this.asyncWithFuture(future, () -> {
                     if (!this.connected) {
                         throw new NotConnectedException();
                     }
 
                     BluetoothGattCharacteristic characteristic = this.getCharacteristicByUuid(uuid);
-                    this.setCommandCallback(new CommandCallback(future) {
+                    this.operations.issue(new CommandCallback() {
                         @Override
                         public void onCharacteristicRead(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
                             Peripheral.this.asyncWithFuture(future, () -> {
@@ -294,7 +294,7 @@ class Peripheral {
                                     throw new UnexpectedCharacteristicException();
                                 }
 
-                                Peripheral.this.wakeCommand(future, characteristic.getValue());
+                                Peripheral.this.operations.complete(future, characteristic.getValue());
                             });
                         }
                     });
@@ -311,7 +311,7 @@ class Peripheral {
     public Future<Void> write(UUID uuid, byte[] data, int writeType) {
         SimpleFuture<Void> future = new SimpleFuture<>();
         synchronized (this) {
-            this.queueCommand(() -> {
+            this.operations.enqueue(Operation.WRITE, future, () -> {
                 this.asyncWithFuture(future, () -> {
                     if (!this.connected) {
                         throw new NotConnectedException();
@@ -320,7 +320,7 @@ class Peripheral {
                     BluetoothGattCharacteristic characteristic = this.getCharacteristicByUuid(uuid);
                     characteristic.setValue(data);
                     characteristic.setWriteType(writeType);
-                    this.setCommandCallback(new CommandCallback(future) {
+                    this.operations.issue(new CommandCallback() {
                         @Override
                         public void onCharacteristicWrite(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
                             Peripheral.this.asyncWithFuture(future, () -> {
@@ -332,7 +332,7 @@ class Peripheral {
                                     throw new UnexpectedCharacteristicException();
                                 }
 
-                                Peripheral.this.wakeCommand(future, null);
+                                Peripheral.this.operations.complete(future, null);
                             });
                         }
                     });
@@ -349,13 +349,13 @@ class Peripheral {
     public Future<List<BluetoothGattService>> discoverServices() {
         SimpleFuture<List<BluetoothGattService>> future = new SimpleFuture<>();
         synchronized (this) {
-            this.queueCommand(() -> {
+            this.operations.enqueue(Operation.DISCOVER_SERVICES, future, () -> {
                 this.asyncWithFuture(future, () -> {
                     if (!this.connected) {
                         throw new NotConnectedException();
                     }
 
-                    this.setCommandCallback(new CommandCallback(future) {
+                    this.operations.issue(new CommandCallback() {
                         @Override
                         public void onServicesDiscovered(BluetoothGatt gatt, int status) {
                             Peripheral.this.asyncWithFuture(future, () -> {
@@ -363,7 +363,7 @@ class Peripheral {
                                     throw new RuntimeException("Unable to discover services, status: " + status);
                                 }
 
-                                Peripheral.this.wakeCommand(future, gatt.getServices());
+                                Peripheral.this.operations.complete(future, gatt.getServices());
                             });
                         }
                     });
@@ -380,7 +380,7 @@ class Peripheral {
     public Future<Void> setCharacteristicNotification(UUID uuid, boolean enable) {
         SimpleFuture<Void> future = new SimpleFuture<>();
         synchronized (this) {
-            this.queueCommand(() -> {
+            this.operations.enqueue(Operation.WRITE_DESCRIPTOR, future, () -> {
                 this.asyncWithFuture(future, () -> {
                     if (!this.connected) {
                         throw new NotConnectedException();
@@ -405,7 +405,7 @@ class Peripheral {
                         throw new RuntimeException("Unable to write client characteristic configuration descriptor");
                     }
 
-                    this.setCommandCallback(new CommandCallback(future) {
+                    this.operations.issue(new CommandCallback() {
                         @Override
                         public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
                             Peripheral.this.asyncWithFuture(future, () -> {
@@ -417,7 +417,7 @@ class Peripheral {
                                     throw new UnexpectedCharacteristicException();
                                 }
 
-                                Peripheral.this.wakeCommand(future, null);
+                                Peripheral.this.operations.complete(future, null);
                             });
                         }
                     });
@@ -439,14 +439,14 @@ class Peripheral {
     public Future<byte[]> readDescriptor(UUID characteristic, UUID uuid) {
         SimpleFuture<byte[]> future = new SimpleFuture<>();
         synchronized (this) {
-            this.queueCommand(() -> {
+            this.operations.enqueue(Operation.READ_DESCRIPTOR, future, () -> {
                 this.asyncWithFuture(future, () -> {
                     if (!this.connected) {
                         throw new NotConnectedException();
                     }
 
                     BluetoothGattDescriptor descriptor = this.getDescriptorByUuid(characteristic, uuid);
-                    this.setCommandCallback(new CommandCallback(future) {
+                    this.operations.issue(new CommandCallback() {
                         @Override
                         public void onDescriptorRead(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
                             Peripheral.this.asyncWithFuture(future, () -> {
@@ -458,7 +458,7 @@ class Peripheral {
                                     throw new UnexpectedCharacteristicException();
                                 }
 
-                                Peripheral.this.wakeCommand(future, descriptor.getValue());
+                                Peripheral.this.operations.complete(future, descriptor.getValue());
                             });
                         }
                     });
@@ -475,7 +475,7 @@ class Peripheral {
     public Future<Void> writeDescriptor(UUID characteristic, UUID uuid, byte[] data) {
         SimpleFuture<Void> future = new SimpleFuture<>();
         synchronized (this) {
-            this.queueCommand(() -> {
+            this.operations.enqueue(Operation.WRITE_DESCRIPTOR, future, () -> {
                 this.asyncWithFuture(future, () -> {
                     if (!this.connected) {
                         throw new NotConnectedException();
@@ -483,7 +483,7 @@ class Peripheral {
 
                     BluetoothGattDescriptor descriptor = this.getDescriptorByUuid(characteristic, uuid);
                     descriptor.setValue(data);
-                    this.setCommandCallback(new CommandCallback(future) {
+                    this.operations.issue(new CommandCallback() {
                         @Override
                         public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
                             Peripheral.this.asyncWithFuture(future, () -> {
@@ -495,7 +495,7 @@ class Peripheral {
                                     throw new UnexpectedCharacteristicException();
                                 }
 
-                                Peripheral.this.wakeCommand(future, null);
+                                Peripheral.this.operations.complete(future, null);
                             });
                         }
                     });
@@ -512,19 +512,19 @@ class Peripheral {
     public Future<Integer> readRemoteRssi() {
         SimpleFuture<Integer> future = new SimpleFuture<>();
         synchronized (this) {
-            this.queueCommand(() -> {
+            this.operations.enqueue(Operation.READ_RSSI, future, () -> {
                 this.asyncWithFuture(future, () -> {
                     if (!this.connected) {
                         throw new NotConnectedException();
                     }
-                    this.setCommandCallback(new CommandCallback(future) {
+                    this.operations.issue(new CommandCallback() {
                         @Override
                         public void onReadRemoteRssi(BluetoothGatt gatt, int rssi, int status) {
                             Peripheral.this.asyncWithFuture(future, () -> {
                                 if (status != BluetoothGatt.GATT_SUCCESS) {
                                     throw new RuntimeException("RSSI read failed, status: " + status);
                                 }
-                                Peripheral.this.wakeCommand(future, rssi);
+                                Peripheral.this.operations.complete(future, rssi);
                             });
                         }
                     });
@@ -571,61 +571,56 @@ class Peripheral {
         throw new NoSuchCharacteristicException();
     }
 
-    private void queueCommand(Runnable callback) {
-        if (this.executingCommand) {
-            this.commandQueue.add(callback);
-        } else {
-            this.executingCommand = true;
-            callback.run();
-        }
-    }
-
-    private void setCommandCallback(CommandCallback callback) {
-        assert this.commandCallback == null;
-        this.commandCallback = callback;
-    }
-
-    private void runNextCommand() {
-        assert this.executingCommand;
-        this.commandCallback = null;
-        if (this.commandQueue.isEmpty()) {
-            this.executingCommand = false;
-        } else {
-            Runnable callback = this.commandQueue.remove();
-            callback.run();
-        }
-    }
-
-    private <T> void wakeCommand(SimpleFuture<T> future, T result) {
-        future.wake(result);
-        this.runNextCommand();
-    }
-
     private <T> void asyncWithFuture(SimpleFuture<T> future, Runnable callback) {
         try {
             callback.run();
         } catch (Throwable ex) {
-            future.wakeWithThrowable(ex);
-            this.runNextCommand();
+            this.operations.fail(future, ex);
         }
     }
 
+    private Runnable scheduleTimer(Runnable task, long delayMs) {
+        ScheduledFuture<?> scheduled = SCHEDULER.schedule(
+                () -> this.runGuarded("deadline", task), delayMs, TimeUnit.MILLISECONDS);
+        return () -> scheduled.cancel(false);
+    }
+
+    private Runnable onDeadline(Operation operation, long deadlineMs, boolean resetLink) {
+        Log.e(TAG, operation + " for " + this.device.getAddress() + " got no callback within " + deadlineMs + " ms");
+        if (!resetLink) {
+            return null;
+        }
+        boolean notifyDisconnected = this.connected;
+        this.loseLink(new OperationTimeoutException(deadlineMs));
+        return notifyDisconnected ? () -> this.adapter.onConnectionStateChanged(this.device.getAddress(), false) : null;
+    }
+
+    private void loseLink(Throwable pendingError) {
+        if (this.gatt != null) {
+            BluetoothGatt gatt = this.gatt;
+            this.gatt = null;
+            this.runGuarded("close", gatt::close);
+        }
+        this.connected = false;
+        this.operations.loseLink(pendingError);
+    }
+
     // Every BluetoothGattCallback method below runs on the Binder thread: none of them may let
-    // a Throwable escape, or the process crashes. dispatchToCommandCallback is the single
-    // choke point that guarantees that for calls forwarded into a CommandCallback.
-    private void dispatchToCommandCallback(String callbackName, Runnable dispatch) {
+    // a Throwable escape, or the process crashes, and no step of link-loss handling may be
+    // skipped because an earlier one threw. runGuarded is the single choke point for both.
+    private void runGuarded(String what, Runnable step) {
         try {
-            dispatch.run();
+            step.run();
         } catch (Throwable ex) {
-            Log.e(TAG, "Unexpected exception dispatching " + callbackName, ex);
+            Log.e(TAG, "Unexpected exception in " + what, ex);
         }
     }
 
     private class Callback extends BluetoothGattCallback {
         @Override
         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
-            boolean suppressDisconnectNotification;
-            boolean nowConnected;
+            boolean notifyConnected;
+            boolean notifyDisconnected;
             synchronized (Peripheral.this) {
                 // connectGatt is always called (and its result assigned to Peripheral.this.gatt)
                 // while holding this same lock, so a callback for a superseded/stale gatt (e.g.
@@ -644,41 +639,38 @@ class Peripheral {
                 }
                 // Reset before dispatch; the command callback below sets it back to true if needed.
                 Peripheral.this.suppressDisconnectNotification = false;
-                if (Peripheral.this.commandCallback != null) {
-                    Peripheral.this.dispatchToCommandCallback("onConnectionStateChange",
-                            () -> Peripheral.this.commandCallback.onConnectionStateChange(gatt, status, newState));
-                }
-                // A disconnected client stays registered with the stack until it is closed, and the
-                // adapter evicts this peripheral on disconnect, so an unclosed client is never
-                // reused. A command in flight closes it itself; close it here when none was.
-                if (newState == BluetoothGatt.STATE_DISCONNECTED && Peripheral.this.gatt == gatt) {
-                    gatt.close();
-                    Peripheral.this.gatt = null;
-                }
-                suppressDisconnectNotification = Peripheral.this.suppressDisconnectNotification;
+                // Nothing waiting starts until link loss below has run, so a queued operation
+                // can't open a new client that loseLink would then close.
+                Peripheral.this.operations.withoutDraining(() -> {
+                    CommandCallback request = Peripheral.this.operations.request();
+                    if (request != null) {
+                        Peripheral.this.runGuarded("onConnectionStateChange",
+                                () -> request.onConnectionStateChange(gatt, status, newState));
+                    }
+                    if (newState == BluetoothGatt.STATE_DISCONNECTED && !Peripheral.this.suppressDisconnectNotification) {
+                        Peripheral.this.runGuarded("link loss", () -> Peripheral.this.loseLink(new NotConnectedException()));
+                    }
+                });
+                notifyDisconnected = newState == BluetoothGatt.STATE_DISCONNECTED && !Peripheral.this.suppressDisconnectNotification;
                 // A failed connect closes the gatt and clears `connected` even if the state was CONNECTED.
-                nowConnected = Peripheral.this.connected;
+                notifyConnected = newState == BluetoothGatt.STATE_CONNECTED && Peripheral.this.connected;
+                Peripheral.this.runGuarded("drain", Peripheral.this.operations::drain);
             }
-            switch (newState) {
-                case BluetoothGatt.STATE_CONNECTED:
-                    if (nowConnected) {
-                        Peripheral.this.adapter.onConnectionStateChanged(Peripheral.this.device.getAddress(), true);
-                    }
-                    break;
-                case BluetoothGatt.STATE_DISCONNECTED:
-                    if (!suppressDisconnectNotification) {
-                        Peripheral.this.adapter.onConnectionStateChanged(Peripheral.this.device.getAddress(), false);
-                    }
-                    break;
+            if (notifyConnected) {
+                Peripheral.this.adapter.onConnectionStateChanged(Peripheral.this.device.getAddress(), true);
+            }
+            if (notifyDisconnected) {
+                Peripheral.this.adapter.onConnectionStateChanged(Peripheral.this.device.getAddress(), false);
             }
         }
 
         @Override
         public void onCharacteristicRead(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
             synchronized (Peripheral.this) {
-                if (Peripheral.this.commandCallback != null) {
-                    Peripheral.this.dispatchToCommandCallback("onCharacteristicRead",
-                            () -> Peripheral.this.commandCallback.onCharacteristicRead(gatt, characteristic, status));
+                CommandCallback request = Peripheral.this.operations.request();
+                if (request != null) {
+                    Peripheral.this.runGuarded("onCharacteristicRead",
+                            () -> request.onCharacteristicRead(gatt, characteristic, status));
                 }
             }
         }
@@ -686,9 +678,10 @@ class Peripheral {
         @Override
         public void onCharacteristicWrite(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
             synchronized (Peripheral.this) {
-                if (Peripheral.this.commandCallback != null) {
-                    Peripheral.this.dispatchToCommandCallback("onCharacteristicWrite",
-                            () -> Peripheral.this.commandCallback.onCharacteristicWrite(gatt, characteristic, status));
+                CommandCallback request = Peripheral.this.operations.request();
+                if (request != null) {
+                    Peripheral.this.runGuarded("onCharacteristicWrite",
+                            () -> request.onCharacteristicWrite(gatt, characteristic, status));
                 }
             }
         }
@@ -696,9 +689,10 @@ class Peripheral {
         @Override
         public void onServicesDiscovered(BluetoothGatt gatt, int status) {
             synchronized (Peripheral.this) {
-                if (Peripheral.this.commandCallback != null) {
-                    Peripheral.this.dispatchToCommandCallback("onServicesDiscovered",
-                            () -> Peripheral.this.commandCallback.onServicesDiscovered(gatt, status));
+                CommandCallback request = Peripheral.this.operations.request();
+                if (request != null) {
+                    Peripheral.this.runGuarded("onServicesDiscovered",
+                            () -> request.onServicesDiscovered(gatt, status));
                 }
             }
         }
@@ -720,9 +714,10 @@ class Peripheral {
         @Override
         public void onDescriptorRead(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
             synchronized (Peripheral.this) {
-                if (Peripheral.this.commandCallback != null) {
-                    Peripheral.this.dispatchToCommandCallback("onDescriptorRead",
-                            () -> Peripheral.this.commandCallback.onDescriptorRead(gatt, descriptor, status));
+                CommandCallback request = Peripheral.this.operations.request();
+                if (request != null) {
+                    Peripheral.this.runGuarded("onDescriptorRead",
+                            () -> request.onDescriptorRead(gatt, descriptor, status));
                 }
             }
         }
@@ -730,9 +725,10 @@ class Peripheral {
         @Override
         public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
             synchronized (Peripheral.this) {
-                if (Peripheral.this.commandCallback != null) {
-                    Peripheral.this.dispatchToCommandCallback("onDescriptorWrite",
-                            () -> Peripheral.this.commandCallback.onDescriptorWrite(gatt, descriptor, status));
+                CommandCallback request = Peripheral.this.operations.request();
+                if (request != null) {
+                    Peripheral.this.runGuarded("onDescriptorWrite",
+                            () -> request.onDescriptorWrite(gatt, descriptor, status));
                 }
             }
         }
@@ -740,9 +736,10 @@ class Peripheral {
         @Override
         public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
             synchronized (Peripheral.this) {
-                if (Peripheral.this.commandCallback != null) {
-                    Peripheral.this.dispatchToCommandCallback("onMtuChanged",
-                            () -> Peripheral.this.commandCallback.onMtuChanged(gatt, mtu, status));
+                CommandCallback request = Peripheral.this.operations.request();
+                if (request != null) {
+                    Peripheral.this.runGuarded("onMtuChanged",
+                            () -> request.onMtuChanged(gatt, mtu, status));
                 }
             }
         }
@@ -750,9 +747,10 @@ class Peripheral {
         @Override
         public void onReadRemoteRssi(BluetoothGatt gatt, int rssi, int status) {
             synchronized (Peripheral.this) {
-                if (Peripheral.this.commandCallback != null) {
-                    Peripheral.this.dispatchToCommandCallback("onReadRemoteRssi",
-                            () -> Peripheral.this.commandCallback.onReadRemoteRssi(gatt, rssi, status));
+                CommandCallback request = Peripheral.this.operations.request();
+                if (request != null) {
+                    Peripheral.this.runGuarded("onReadRemoteRssi",
+                            () -> request.onReadRemoteRssi(gatt, rssi, status));
                 }
             }
         }
@@ -770,28 +768,10 @@ class Peripheral {
     }
 
     private abstract class CommandCallback extends BluetoothGattCallback {
-        private final SimpleFuture<?> future;
-
-        CommandCallback(SimpleFuture<?> future) {
-            this.future = future;
-        }
-
-        // Default: a disconnect during any command this base isn't overridden for (i.e. every
-        // command except connect/disconnect themselves, which override this) fails that
-        // command's future with NotConnectedException and advances the queue, instead of relying
-        // on each subclass to remember to override this. connect/disconnect have their own
-        // onConnectionStateChange semantics and override this method entirely.
+        // Link loss is handled by the main callback for every operation; connect and disconnect
+        // override this only to observe the state change they asked for.
         @Override
         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
-            if (newState == BluetoothGatt.STATE_DISCONNECTED) {
-                Peripheral.this.asyncWithFuture(this.future, () -> {
-                    if (Peripheral.this.gatt != null) {
-                        Peripheral.this.gatt.close();
-                        Peripheral.this.gatt = null;
-                    }
-                    throw new NotConnectedException();
-                });
-            }
         }
 
         // The following are stray/unsolicited callbacks for a command that didn't ask for them

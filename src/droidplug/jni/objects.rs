@@ -36,6 +36,10 @@ bind_java_type! {
 }
 
 bind_java_type! {
+    pub JOperationTimeoutException => "com.nonpolynomial.btleplug.android.impl.OperationTimeoutException",
+}
+
+bind_java_type! {
     pub JScanFilterClass => "com.nonpolynomial.btleplug.android.impl.ScanFilter",
 }
 

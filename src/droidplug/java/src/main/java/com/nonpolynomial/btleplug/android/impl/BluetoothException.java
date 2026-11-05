@@ -8,4 +8,8 @@ class BluetoothException extends RuntimeException {
     public BluetoothException(Throwable cause) {
         super(cause);
     }
+
+    public BluetoothException(String message) {
+        super(message);
+    }
 }
